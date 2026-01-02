@@ -101,7 +101,7 @@ generated with `cargo deny list`.
 
 The [publicly installable bot][bot install] provided by us is available under our [Terms of Service](TERMS.md) and [Privacy Policy](PRIVACY.md).
 
-[bot install]: https://discord.com/oauth2/authorize?client_id=1270708639145001052
+[bot install]: https://discord.com/oauth2/authorize?client_id=1456732398485110916
 [discord]: https://discord.gg/aKkA6m26f9
 [issues]: https://github.com/zkxs/jinx/issues
 [app directory]: https://discord.com/application-directory/1456732398485110916
