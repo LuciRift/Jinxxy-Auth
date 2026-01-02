@@ -104,4 +104,4 @@ The [publicly installable bot][bot install] provided by us is available under ou
 [bot install]: https://discord.com/oauth2/authorize?client_id=1270708639145001052
 [discord]: https://discord.gg/aKkA6m26f9
 [issues]: https://github.com/zkxs/jinx/issues
-[app directory]: https://discord.com/application-directory/1270708639145001052
+[app directory]: https://discord.com/application-directory/1456732398485110916
