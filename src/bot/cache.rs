@@ -1,4 +1,4 @@
-// This file is part of jinx. Copyright © 2025 jinx contributors.
+// This file is part of jinx. Copyright © 2025-2026 jinx contributors.
 // jinx is licensed under the GNU AGPL v3.0 or any later version. See LICENSE file for full text.
 
 //! A store-level cache of Jinxxy API results.
@@ -9,20 +9,20 @@
 //!
 //! The idea here is we have a cache with a short expiry time (maybe 60s) and we reuse the results.
 
-use crate::bot::{AUTOCOMPLETE_RESULT_LIMIT, MISSING_API_KEY_MESSAGE};
-use crate::bot::{SECONDS_PER_DAY, util};
+use crate::bot::{AUTOCOMPLETE_RESULT_LIMIT, MISSING_API_KEY_MESSAGE, util};
+use crate::constants::SECONDS_PER_DAY;
 use crate::db;
 use crate::db::{JinxDb, LinkedStore};
 use crate::error::JinxError;
 use crate::http::jinxxy;
-use crate::http::jinxxy::{
-    LoadedProduct, PartialProduct, ProductNameInfo, ProductNameInfoValue, ProductVersionId, ProductVersionNameInfo,
-};
+use crate::http::jinxxy::{PartialProduct, ProductNameInfo, ProductVersionId, ProductVersionNameInfo};
 use crate::time::SimpleTime;
 use poise::serenity_prelude::GuildId;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering as AtomicOrdering;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::time::{Duration, timeout};
@@ -66,6 +66,7 @@ pub struct ApiCache {
     /// sending a None is considered a "bump", indicating we should re-check the next queued item
     refresh_register_tx: mpsc::Sender<Option<String>>,
     refresh_unregister_tx: mpsc::Sender<String>,
+    registered_store_count: Arc<AtomicU64>,
 }
 
 impl ApiCache {
@@ -74,6 +75,7 @@ impl ApiCache {
         let (high_priority_tx, mut high_priority_rx) = mpsc::channel::<(GuildId, String)>(QUEUE_SIZE);
         let (refresh_register_tx, mut refresh_register_rx) = mpsc::channel::<Option<String>>(QUEUE_SIZE);
         let (refresh_unregister_tx, mut refresh_unregister_rx) = mpsc::channel::<String>(QUEUE_SIZE);
+        let registered_store_count = Arc::new(AtomicU64::new(0));
 
         /* High priority refresh task.
 
@@ -178,6 +180,7 @@ impl ApiCache {
         {
             let db = db;
             let map = map.clone();
+            let registered_store_count = registered_store_count.clone();
             tokio::task::spawn(async move {
                 // set of all registered store ids
                 let mut store_set = HashSet::with_hasher(ahash::RandomState::default());
@@ -300,7 +303,7 @@ impl ApiCache {
                             }
                             // end of inner loop
                             // the event processing is now done, so process stores until none are expired in a "work loop"
-
+                            registered_store_count.store(store_set.len() as u64, AtomicOrdering::Relaxed);
                             let mut now = SimpleTime::now(); // initialize it to some arbitrary default: we set it later.
                             let mut work_remaining = true;
                             let mut work_counter = 0;
@@ -482,6 +485,7 @@ impl ApiCache {
                                     } else {
                                         // something about the store was screwed up so we're just going to unregister it
                                         store_set.remove(&queue_entry.jinxxy_user_id);
+                                        registered_store_count.store(store_set.len() as u64, AtomicOrdering::Relaxed);
                                     }
 
                                     // if we haven't touched the next store ID yet, then go again (true)
@@ -540,6 +544,7 @@ impl ApiCache {
             high_priority_tx,
             refresh_register_tx,
             refresh_unregister_tx,
+            registered_store_count,
         }
     }
 
@@ -656,8 +661,14 @@ impl ApiCache {
         Ok(result)
     }
 
+    /// Get total number of stores in the store cache
     pub fn len(&self) -> usize {
         self.map.len()
+    }
+
+    /// Get total number of registered stores in the store cache
+    pub fn registered_stores(&self) -> u64 {
+        self.registered_store_count.load(AtomicOrdering::Relaxed)
     }
 
     pub fn product_count(&self) -> usize {
@@ -845,67 +856,40 @@ impl StoreCache {
         // list products
         let partial_products: Vec<PartialProduct> = jinxxy::get_products(api_key).await?;
 
-        // get details for each product
-        let mut products: Vec<LoadedProduct> =
-            jinxxy::get_full_products::<PARALLEL>(db, api_key, jinxxy_user_id, partial_products)
-                .await?
-                .into_iter()
-                .filter(|product| {
-                    // products with empty names are kinda weird, so I'm just gonna filter them to avoid any potential pitfalls
-                    match product {
-                        LoadedProduct::Api(product) => !product.name.is_empty(),
-                        LoadedProduct::Cached { .. } => true,
-                    }
-                })
-                .collect();
-
         // convert into map tuples for products without versions
-        let product_name_info: Vec<ProductNameInfo> = products
-            .iter_mut()
-            .map(|product| match product {
-                LoadedProduct::Api(product) => {
-                    let id = product.id.clone();
-                    let product_name = util::truncate_string_for_discord_autocomplete(&product.name);
-                    let etag = product.etag.clone();
-                    ProductNameInfo {
-                        id,
-                        value: ProductNameInfoValue { product_name, etag },
-                    }
-                }
-                LoadedProduct::Cached { product_info, .. } => product_info.take().expect(
-                    "product_info is specifically in an option so I can take() it later, this should not have failed",
-                ),
+        let product_name_info: Vec<ProductNameInfo> = partial_products
+            .iter()
+            .map(|product| {
+                let id = product.id.clone();
+                let product_name = util::truncate_string_for_discord_autocomplete(&product.name);
+                ProductNameInfo { id, product_name }
             })
             .collect();
 
         // convert into map tuples for product versions
-        let product_version_name_info: Vec<ProductVersionNameInfo> = products
+        let product_version_name_info: Vec<ProductVersionNameInfo> = partial_products
             .into_iter()
-            .flat_map(|product| match product {
-                LoadedProduct::Api(product) => {
-                    let null_name_info = ProductVersionNameInfo {
-                        id: ProductVersionId::from_product_id(&product.id),
-                        product_version_name: util::product_display_name(&product.name, None),
-                    };
-                    let null_iter = std::iter::once(null_name_info);
+            .flat_map(|product| {
+                let null_name_info = ProductVersionNameInfo {
+                    id: ProductVersionId::from_product_id(&product.id),
+                    product_version_name: util::product_display_name(&product.name, None),
+                };
+                let null_iter = std::iter::once(null_name_info);
 
-                    let iter = product.versions.into_iter().map(move |version| {
-                        let id = ProductVersionId {
-                            product_id: product.id.clone(),
-                            product_version_id: Some(version.id.clone()),
-                        };
-                        let product_version_name =
-                            util::product_display_name(&product.name, Some(version.name.as_str()));
-                        ProductVersionNameInfo {
-                            id,
-                            product_version_name,
-                        }
-                    });
-                    let iter = null_iter.chain(iter);
-                    let iter: Box<dyn Iterator<Item = _>> = Box::new(iter);
-                    iter
-                }
-                LoadedProduct::Cached { versions, .. } => Box::new(versions.into_iter()),
+                let iter = product.versions.into_iter().map(move |version| {
+                    let id = ProductVersionId {
+                        product_id: product.id.clone(),
+                        product_version_id: Some(version.id.clone()),
+                    };
+                    let product_version_name = util::product_display_name(&product.name, Some(version.name.as_str()));
+                    ProductVersionNameInfo {
+                        id,
+                        product_version_name,
+                    }
+                });
+                let iter = null_iter.chain(iter);
+                let iter: Box<dyn Iterator<Item = _>> = Box::new(iter);
+                iter
             })
             .collect();
 
@@ -978,7 +962,7 @@ impl StoreCache {
         let product_name_trie = {
             let mut trie_builder = TrieBuilder::new();
             for name_info in product_name_info.iter() {
-                let name = &name_info.value.product_name;
+                let name = &name_info.product_name;
                 trie_builder.push(name.to_lowercase(), name.to_string());
             }
             trie_builder.build()
@@ -997,7 +981,7 @@ impl StoreCache {
         // build forward map without versions
         let product_id_to_name_map = product_name_info
             .iter()
-            .map(|name_info| (name_info.id.clone(), name_info.value.product_name.clone()))
+            .map(|name_info| (name_info.id.clone(), name_info.product_name.clone()))
             .collect();
 
         // build forward map with versions
@@ -1010,7 +994,7 @@ impl StoreCache {
         let mut product_name_to_id_map: HashMap<String, Vec<GlobalProductId>, ahash::RandomState> = Default::default();
         for name_info in product_name_info {
             product_name_to_id_map
-                .entry(name_info.value.product_name)
+                .entry(name_info.product_name)
                 .or_default()
                 .push(GlobalProductId {
                     jinxxy_user_id: jinxxy_user_id.to_owned(),

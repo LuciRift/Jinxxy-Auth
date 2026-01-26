@@ -1,12 +1,12 @@
-// This file is part of jinx. Copyright © 2025 jinx contributors.
+// This file is part of jinx. Copyright © 2025-2026 jinx contributors.
 // jinx is licensed under the GNU AGPL v3.0 or any later version. See LICENSE file for full text.
 
 use crate::bot::util::{error_reply, success_reply};
 use crate::bot::{Context, MISSING_STORE_LINK_MESSAGE, util};
-use crate::db::LinkSource;
+use crate::db::{ActivationCounts, LinkSource};
 use crate::error::JinxError;
 use crate::http::jinxxy;
-use crate::http::jinxxy::{GetProfileImageUrl as _, GetUsername, Username};
+use crate::http::jinxxy::{GetProfileImageUrl as _, GetUsername as _, Username};
 use crate::license::LOCKING_USER_ID;
 use ahash::HashSet;
 use jiff::Timestamp;
@@ -38,7 +38,13 @@ pub(in crate::bot) async fn stats(context: Context<'_>) -> Result<(), Error> {
     let guild_id = context
         .guild_id()
         .ok_or_else(|| JinxError::new("expected to be in a guild"))?;
-    let license_activation_count = context.data().db.guild_license_activation_count(guild_id).await?;
+    let ActivationCounts {
+        day_7,
+        day_30,
+        day_90,
+        day_365,
+        lifetime,
+    } = context.data().db.guild_license_activation_count(guild_id).await?;
     let gumroad_failure_count = context
         .data()
         .db
@@ -47,8 +53,12 @@ pub(in crate::bot) async fn stats(context: Context<'_>) -> Result<(), Error> {
         .unwrap_or(0);
 
     let message = format!(
-        "license activations={license_activation_count}\n\
-        failed gumroad licenses={gumroad_failure_count}"
+        "license activations (7d)={day_7}\n\
+        license activations (30d)={day_30}\n\
+        license activations (90d)={day_90}\n\
+        license activations (1yr)={day_365}\n\
+        license activations (lifetime)={lifetime}\n\
+        gumroad licenses rejected={gumroad_failure_count}"
     );
     let embed = CreateEmbed::default().title("Jinx Stats").description(message);
     context
@@ -297,7 +307,7 @@ pub async fn user_info(
                     let jinxxy_user_id = license_id.jinxxy_user_id.clone();
                     let product_id = license_info.product_id.clone();
                     product_lookup_join_set.spawn(async move {
-                        jinxxy::get_product_uncached(&api_key, &product_id)
+                        jinxxy::get_product(&api_key, &product_id)
                             .await
                             .map(|product_info| (jinxxy_user_id, product_info))
                     });
@@ -348,21 +358,25 @@ pub async fn user_info(
                         .await?
                         .is_some();
 
-                    let username =
-                        Username::format_discord_display_name(&license_info.user_id, license_info.username.as_deref());
                     let store_identifier =
                         Username::format_discord_display_name(jinxxy_user_id, license_id.jinxxy_username.as_deref());
+                    let customer_id = license_info.user_id;
+                    let order = license_info
+                        .order_id
+                        .map(|order_id| format!(" [order](<https://dashboard.jinxxy.com/orders/{order_id}>)"))
+                        .unwrap_or_default();
 
                     message.push_str(
                         format!(
-                            "\n- `{}` store={} activations={} locked={} user={} product=\"{}\" version={}",
+                            "\n- `{}` store={} activations={} locked={} product=\"{}\" version={} [customer](<https://dashboard.jinxxy.com/customers/{}>){}",
                             license_info.short_key,
                             store_identifier,
                             license_info.activations, // this field came from Jinxxy and is up to date
                             locked,                   // this field came from the local DB and may be out of sync
-                            username,
                             license_info.product_name,
-                            product_version_name
+                            product_version_name,
+                            customer_id,
+                            order,
                         )
                         .as_str(),
                     );
@@ -514,16 +528,33 @@ pub async fn license_info(
                     .as_ref()
                     .map(|info| info.product_version_name.as_str())
                     .unwrap_or("`null`");
+                let customer_id = license_info.user_id;
+                let order = license_info
+                    .order_id
+                    .map(|order_id| format!("\n[order](<https://dashboard.jinxxy.com/orders/{order_id}>)"))
+                    .unwrap_or_default();
 
                 let message = if remote_license_users.is_empty() {
                     format!(
-                        "ID: `{}`\nShort: `{}`\nLong: `{}`\nValid for {} {}\n\nNo registered users.",
-                        license_info.license_id, license_info.short_key, license_info.key, product_name, version_name
+                        "ID: `{}`\nShort: `{}`\nLong: `{}`\nValid for {} {}\n[customer](<https://dashboard.jinxxy.com/customers/{}>){}\n\nNo registered users.",
+                        license_info.license_id,
+                        license_info.short_key,
+                        license_info.key,
+                        product_name,
+                        version_name,
+                        customer_id,
+                        order,
                     )
                 } else {
                     let mut message = format!(
-                        "ID: `{}`\nShort: `{}`\nLong: `{}`\nValid for {} {}\n\nRegistered users:",
-                        license_info.license_id, license_info.short_key, license_info.key, product_name, version_name
+                        "ID: `{}`\nShort: `{}`\nLong: `{}`\nValid for {} {}\n[customer](<https://dashboard.jinxxy.com/customers/{}>){}\n\nRegistered users:",
+                        license_info.license_id,
+                        license_info.short_key,
+                        license_info.key,
+                        product_name,
+                        version_name,
+                        customer_id,
+                        order,
                     );
                     for user_id in &remote_license_users {
                         if *user_id == LOCKING_USER_ID {

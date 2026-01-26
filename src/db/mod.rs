@@ -1,11 +1,11 @@
-// This file is part of jinx. Copyright © 2025 jinx contributors.
+// This file is part of jinx. Copyright © 2025-2026 jinx contributors.
 // jinx is licensed under the GNU AGPL v3.0 or any later version. See LICENSE file for full text.
 
 mod schema_v1;
 mod schema_v2;
 
 use crate::error::JinxError;
-use crate::http::jinxxy::{ProductNameInfo, ProductNameInfoValue, ProductVersionId, ProductVersionNameInfo};
+use crate::http::jinxxy::{ProductNameInfo, ProductVersionId, ProductVersionNameInfo};
 use crate::time::SimpleTime;
 use jiff::Timestamp;
 use poise::futures_util::TryStreamExt;
@@ -30,6 +30,7 @@ const DB_V2_FILENAME: &str = "jinx2.sqlite";
 const DISCORD_TOKEN_KEY: &str = "discord_token";
 const LOW_PRIORITY_CACHE_EXPIRY_SECONDS: &str = "low_priority_cache_expiry_seconds";
 const CAN_NAG_PUBLIC_CHANNELS: &str = "can_nag_public_channels";
+const STALE_GUILD_DELETE_LIMIT: &str = "stale_guild_delete_limit";
 
 type JinxResult<T> = Result<T, JinxError>;
 type SqliteResult<T> = Result<T, SqlxError>;
@@ -223,6 +224,14 @@ impl JinxDb {
         Ok(can_nag.unwrap_or(false))
     }
 
+    pub async fn stale_guild_delete_limit(&self) -> JinxResult<Option<u64>> {
+        let limit = self
+            .get_setting::<i64>(STALE_GUILD_DELETE_LIMIT)
+            .await?
+            .map(|limit| limit as u64);
+        Ok(limit)
+    }
+
     pub async fn get_owners(&self) -> JinxResult<Vec<u64>> {
         let result = sqlx::query!(r#"SELECT owner_id FROM owner"#)
             .map(|row| row.owner_id as u64)
@@ -262,6 +271,65 @@ impl JinxDb {
             .await?
             .map(|secs| Duration::from_secs(secs as u64));
         Ok(low_priority_cache_expiry_time)
+    }
+
+    /// Get an arbitrary license activation needing backfill
+    pub async fn get_activations_needing_backfill(&self) -> JinxResult<Vec<BackfillLicenseActivation>> {
+        let result = sqlx::query!(
+            r#"SELECT jinxxy_api_key, jinxxy_user_id, license_id, activator_user_id, license_activation_id FROM license_activation
+               JOIN jinxxy_user_guild USING (jinxxy_user_id)
+               WHERE jinxxy_api_key_valid
+               AND created_at IS NULL"#
+        )
+        .map(|row| BackfillLicenseActivation {
+            jinxxy_api_key: row.jinxxy_api_key,
+            jinxxy_user_id: row.jinxxy_user_id,
+            license_id: row.license_id,
+            activator_user_id: UserId::new(row.activator_user_id as u64),
+            license_activation_id: row.license_activation_id,
+        })
+        .fetch_all(&self.read_pool)
+        .await?;
+        Ok(result)
+    }
+
+    /// Backfill `created_at` into an existing license activation. Returns `true` if a single row was updated,
+    /// or false if no rows were updated.
+    pub async fn backfill_activation(
+        &self,
+        jinxxy_user_id: &str,
+        license_id: &str,
+        activator: UserId,
+        activation_id: &str,
+        created_at: &Timestamp,
+    ) -> JinxResult<bool> {
+        let activator_user_id = activator.get() as i64;
+        let created_at = created_at.as_second();
+        let mut connection = self.write_connection().await?;
+        let result = sqlx::query!(
+            r#"UPDATE license_activation
+               SET created_at = ?
+               WHERE jinxxy_user_id = ?
+               AND license_id = ?
+               AND activator_user_id = ?
+               AND license_activation_id = ?"#,
+            created_at,
+            jinxxy_user_id,
+            license_id,
+            activator_user_id,
+            activation_id
+        )
+        .execute(&mut *connection)
+        .await?;
+        if result.rows_affected() == 0 {
+            Ok(false)
+        } else if result.rows_affected() == 1 {
+            Ok(true)
+        } else {
+            Err(JinxError::new(
+                "Expected at most one row to be updated during backfill_activation",
+            ))
+        }
     }
 
     /// Locally record that we've activated a license for a user. Returns `true` if a row was created, or `false` if a row was not created
@@ -437,6 +505,7 @@ impl JinxDb {
     /// - all `product_role` and `product_version_role` entries referencing the removed `jinxxy_user_guild` entries
     ///   (handled automatically by ON DELETE CASCADE)
     /// - all `jinxxy_user` entries that are no longer linked to any guild via `jinxxy_user_guild`
+    /// - all `license_activation` entries referencing a deleted jinxxy user (handled automatically by ON DELETE CASCADE)
     ///
     /// Finally, this returns `jinxxy_user_id: String` for all stores that have been deleted. These store IDs must be
     /// subsequently unregistered from the cache background job.
@@ -450,26 +519,31 @@ impl JinxDb {
     }
 
     /// Provided a list, `guilds`, of all guilds the bot is currently in, scan the DB for any guilds we're not in and
-    /// delete their data.
+    /// delete their data. `max` is the maximum number of guilds to delete. If more than `max` stale guilds are
+    /// calculated, this function will not perform any deletes and will return `None`. Otherwise, a list of deleted
+    /// Jinxxy user IDs will be returned.
     ///
     /// See [`delete_guild`](JinxDb::delete_guild) for details on what, specifically, is deleted.
-    #[allow(dead_code)]
-    pub async fn delete_stale_guilds(&self, guilds: &[GuildId]) -> JinxResult<Vec<String>> {
-        let mut deleted_users = Vec::new();
+    pub async fn delete_stale_guilds(&self, guilds: &[GuildId], max: u64) -> JinxResult<Option<Vec<String>>> {
+        let max = usize::try_from(max)
+            .map_err(|_| JinxError::new("could not convert delete_stale_guilds max into a usize"))?;
         let mut connection = self.write_connection().await?;
         let mut transaction = connection.begin().await?;
-
         let stale_guilds = helper::get_stale_guilds(&mut transaction, guilds).await?;
-        for guild_id in stale_guilds {
-            deleted_users.extend(helper::delete_guild(&mut transaction, guild_id).await?);
-        }
-
+        let result = if stale_guilds.len() > max {
+            None
+        } else {
+            let mut deleted_users = Vec::new();
+            for guild_id in stale_guilds {
+                deleted_users.extend(helper::delete_guild(&mut transaction, guild_id).await?);
+            }
+            Some(deleted_users)
+        };
         transaction.commit().await?;
-        Ok(deleted_users)
+        Ok(result)
     }
 
     /// Provided a list, `guilds`, of all guilds the bot is currently in, scan the DB for any guilds we're not in.
-    #[allow(dead_code)]
     pub async fn get_stale_guilds(&self, guilds: &[GuildId]) -> JinxResult<Vec<GuildId>> {
         let mut connection = self.write_connection().await?;
         let mut transaction = connection.begin().await?;
@@ -619,6 +693,18 @@ impl JinxDb {
         .execute(&mut *connection)
         .await?;
         Ok(())
+    }
+
+    /// Check if any keys for this guild are marked as invalid
+    pub async fn has_invalid_jinxxy_api_key(&self, guild: GuildId) -> JinxResult<bool> {
+        let guild_id = guild.get() as i64;
+        let result = sqlx::query_scalar!(
+            r#"SELECT EXISTS(SELECT * FROM jinxxy_user_guild WHERE guild_id = ? AND NOT jinxxy_api_key_valid) AS "invalid: bool""#,
+            guild_id
+        )
+        .fetch_one(&self.read_pool)
+        .await?;
+        Ok(result)
     }
 
     /// Check if this guild has any Jinxxy stores linked
@@ -1266,18 +1352,25 @@ impl JinxDb {
     }
 
     /// Get count of license activations in a guild
-    pub async fn guild_license_activation_count(&self, guild: GuildId) -> JinxResult<u64> {
-        let guild_id = guild.get() as i64;
-        let result = sqlx::query!(
-                 r#"SELECT count(*) AS "count!" FROM (
-                    SELECT DISTINCT jinxxy_user_id, license_id, activator_user_id, license_activation_id FROM license_activation
-                    INNER JOIN jinxxy_user_guild USING (jinxxy_user_id)
-                    WHERE guild_id = ?
-                )"#, guild_id)
-            .map(|row| row.count as u64)
-            .fetch_one(&self.read_pool)
-            .await?;
-        Ok(result)
+    pub async fn guild_license_activation_count(&self, guild: GuildId) -> JinxResult<ActivationCounts> {
+        const SECONDS_PER_DAY: i64 = crate::constants::SECONDS_PER_DAY as i64;
+        let mut connection = self.read_pool.acquire().await?;
+        let mut transaction = connection.begin().await?;
+        let day_7 = helper::guild_license_activation_count(&mut transaction, guild, Some(SECONDS_PER_DAY * 7)).await?;
+        let day_30 =
+            helper::guild_license_activation_count(&mut transaction, guild, Some(SECONDS_PER_DAY * 30)).await?;
+        let day_90 =
+            helper::guild_license_activation_count(&mut transaction, guild, Some(SECONDS_PER_DAY * 90)).await?;
+        let day_365 =
+            helper::guild_license_activation_count(&mut transaction, guild, Some(SECONDS_PER_DAY * 365)).await?;
+        let lifetime = helper::guild_license_activation_count(&mut transaction, guild, None).await?;
+        Ok(ActivationCounts {
+            day_7,
+            day_30,
+            day_90,
+            day_365,
+            lifetime,
+        })
     }
 
     /// Get bot log channel
@@ -1505,36 +1598,6 @@ impl JinxDb {
         transaction.commit().await?;
         Ok(())
     }
-
-    /// Get cached name info for products in a guild
-    pub async fn product_names_in_store(&self, jinxxy_user_id: &str) -> JinxResult<Vec<ProductNameInfo>> {
-        let mut connection = self.read_pool.acquire().await?;
-        let result = helper::product_names_in_store(&mut connection, jinxxy_user_id).await?;
-        Ok(result)
-    }
-
-    /// Get versions for a product
-    pub async fn product_versions(
-        &self,
-        jinxxy_user_id: &str,
-        product_id: &str,
-    ) -> JinxResult<Vec<ProductVersionNameInfo>> {
-        let result = sqlx::query!(
-            r#"SELECT version_id, product_version_name FROM product_version WHERE jinxxy_user_id = ? AND product_id = ?"#,
-            jinxxy_user_id,
-            product_id
-        )
-            .map(|row| ProductVersionNameInfo {
-                id: ProductVersionId {
-                    product_id: product_id.to_string(),
-                    product_version_id: Some(row.version_id),
-                },
-                product_version_name: row.product_version_name,
-            })
-            .fetch_all(&self.read_pool)
-            .await?;
-        Ok(result)
-    }
 }
 
 /// Helper functions that don't access a whole pool
@@ -1607,21 +1670,55 @@ mod helper {
         Ok(())
     }
 
+    /// Get count of license activations in a guild
+    pub async fn guild_license_activation_count(
+        transaction: &mut SqliteTransaction<'_>,
+        guild: GuildId,
+        seconds: Option<i64>,
+    ) -> JinxResult<u64> {
+        let guild_id = guild.get() as i64;
+        let result = if let Some(seconds) = seconds {
+            sqlx::query!(
+                 r#"SELECT count(*) AS "count!" FROM (
+                    SELECT DISTINCT jinxxy_user_id, license_id, activator_user_id, license_activation_id FROM license_activation
+                    INNER JOIN jinxxy_user_guild USING (jinxxy_user_id)
+                    WHERE guild_id = ?
+                    AND created_at > unixepoch() - ?
+                 )"#,
+                guild_id,
+                seconds,
+            )
+            .map(|row| row.count as u64)
+            .fetch_one(&mut **transaction)
+            .await?
+        } else {
+            sqlx::query!(
+                 r#"SELECT count(*) AS "count!" FROM (
+                    SELECT DISTINCT jinxxy_user_id, license_id, activator_user_id, license_activation_id FROM license_activation
+                    INNER JOIN jinxxy_user_guild USING (jinxxy_user_id)
+                    WHERE guild_id = ?
+                 )"#,
+                guild_id,
+            )
+            .map(|row| row.count as u64)
+            .fetch_one(&mut **transaction)
+            .await?
+        };
+        Ok(result)
+    }
+
     /// Get cached name info for products in a guild
     pub(super) async fn product_names_in_store(
         connection: &mut SqliteConnection,
         jinxxy_user_id: &str,
     ) -> SqliteResult<Vec<ProductNameInfo>> {
         sqlx::query!(
-            r#"SELECT product_id, product_name, etag FROM product WHERE jinxxy_user_id = ?"#,
+            r#"SELECT product_id, product_name FROM product WHERE jinxxy_user_id = ?"#,
             jinxxy_user_id
         )
         .map(|row| ProductNameInfo {
             id: row.product_id,
-            value: ProductNameInfoValue {
-                product_name: row.product_name,
-                etag: row.etag,
-            },
+            product_name: row.product_name,
         })
         .fetch_all(connection)
         .await
@@ -1658,18 +1755,16 @@ mod helper {
         // step 1: insert all entries and keep track of their keys in a set for later
         for info in product_name_info {
             let product_id = info.id;
-            let product_name = info.value.product_name;
-            let etag = info.value.etag;
+            let product_name = info.product_name;
             sqlx::query!(
-                r#"INSERT INTO product (jinxxy_user_id, product_id, product_name, etag) VALUES (?, ?, ?, ?)
-                   ON CONFLICT (jinxxy_user_id, product_id) DO UPDATE SET product_name = excluded.product_name, etag = excluded.etag"#,
+                r#"INSERT INTO product (jinxxy_user_id, product_id, product_name) VALUES (?, ?, ?)
+                   ON CONFLICT (jinxxy_user_id, product_id) DO UPDATE SET product_name = excluded.product_name"#,
                 jinxxy_user_id,
                 product_id,
                 product_name,
-                etag
             )
-                .execute(&mut *connection)
-                .await?;
+            .execute(&mut *connection)
+            .await?;
             new_key_set.insert(product_id);
         }
 
@@ -1987,7 +2082,7 @@ pub struct LinkedStore {
 
 /// Different modes of WAL checkpoint: https://sqlite.org/pragma.html#pragma_wal_checkpoint
 #[derive(Copy, Clone)]
-#[allow(dead_code)]
+#[allow(dead_code)] // we hardcode a specific mode
 pub enum SqliteWalCheckpoint {
     /// Checkpoint as many frames as possible without waiting for any database readers or writers to finish. Sync the
     /// db file if all frames in the log are checkpointed. This mode is the same as calling the
@@ -2063,7 +2158,7 @@ pub struct SqliteDatabaseSize {
     page_size: u64,
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // has a bunch of functionality I currently don't use
 impl SqliteDatabaseSize {
     /// Number of total pages in the DB, including both used pages and unused "freelist" pages.
     pub fn page_count(&self) -> u64 {
@@ -2094,4 +2189,23 @@ impl SqliteDatabaseSize {
     pub fn used_bytes(&self) -> u64 {
         (self.page_count - self.freelist_count) * self.page_size
     }
+}
+
+/// Helper struct returned by [`JinxDb::get_activation_needing_backfill`]
+#[derive(Clone)]
+pub struct BackfillLicenseActivation {
+    pub jinxxy_api_key: String,
+    pub jinxxy_user_id: String,
+    pub license_id: String,
+    pub activator_user_id: UserId,
+    pub license_activation_id: String,
+}
+
+/// Helper struct returned by [`JinxDb::guild_license_activation_count`]
+pub struct ActivationCounts {
+    pub day_7: u64,
+    pub day_30: u64,
+    pub day_90: u64,
+    pub day_365: u64,
+    pub lifetime: u64,
 }

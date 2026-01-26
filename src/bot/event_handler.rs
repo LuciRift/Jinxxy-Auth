@@ -1,8 +1,8 @@
-// This file is part of jinx. Copyright © 2025 jinx contributors.
+// This file is part of jinx. Copyright © 2025-2026 jinx contributors.
 // jinx is licensed under the GNU AGPL v3.0 or any later version. See LICENSE file for full text.
 
 use crate::bot::commands::{LICENSE_KEY_ID, REGISTER_BUTTON_ID};
-use crate::bot::util::{MessageExtensions, SafeDisplay};
+use crate::bot::util::{MessageExtensions as _, SafeDisplay as _};
 use crate::bot::{BAKED_GLOBAL_COMMANDS, CUSTOM_ID_CHARACTER_LIMIT, GuildCreateEvent, util};
 use crate::bot::{Data, REGISTER_MODAL_ID};
 use crate::db::JinxDb;
@@ -13,10 +13,10 @@ use jiff::Timestamp;
 use poise::{async_trait, serenity_prelude as serenity};
 use regex::Regex;
 use serenity::{
-    Colour, Component, Context, CreateEmbed, CreateInputText, CreateInteractionResponse,
-    CreateInteractionResponseMessage, CreateLabel, CreateMessage, CreateModal, CreateModalComponent, CreateTextDisplay,
-    EditInteractionResponse, Error, Event, EventHandler, FullEvent, GenericChannelId, GuildId, InputTextStyle,
-    Interaction, LabelComponent, ModalInteraction, RatelimitInfo,
+    Colour, Context, CreateEmbed, CreateInputText, CreateInteractionResponse, CreateInteractionResponseMessage,
+    CreateLabel, CreateMessage, CreateModal, CreateModalComponent, CreateTextDisplay, EditInteractionResponse, Error,
+    Event, EventHandler, FullEvent, GenericChannelId, GuildId, InputTextStyle, Interaction, LabelComponent,
+    ModalComponent, ModalInteraction, RatelimitInfo,
 };
 use std::borrow::Cow;
 use std::sync::LazyLock;
@@ -474,7 +474,8 @@ impl EventHandler for Data {
             /*
             the docs claim this happens "when the cache has received and inserted all data from
             guilds" and that "this process happens upon starting your bot". HOWEVER, it apparently
-            ALSO happens every single time any new guild is added.
+            ALSO happens every single time the bot joins a new guild. To mitigate this, we'd need an
+            AtomicBool and probably some janky handling for Resumed events
             */
             FullEvent::CacheReady { guilds, .. } => {
                 debug!("cache ready! {} guilds.", guilds.len());
@@ -488,21 +489,27 @@ impl EventHandler for Data {
                     Err(e) => error!("Error enumerating stale guilds: {e:?}"),
                 }
 
-                /* TODO: enable this
-                match self.db.delete_stale_guilds(guilds).await {
-                    Ok(deleted_stores) => {
-                        info!("Deleted {} stale stores", deleted_stores.len());
-                        for jinxxy_user_id in deleted_stores {
-                            let result = self.api_cache.unregister_store_in_cache(jinxxy_user_id).await;
-                            if let Err(e) = result {
-                                warn!("Error unregistering store in cache during stale guild delete: {e:?}");
-                                return;
+                // disabled behind a feature flag.
+                // I'll enable this once I'm sure CacheReady doesn't ever trigger until all guilds are loaded AND that it's not per-shard.
+                // in the meantime, the /delete_stale_guilds command does the same thing but isn't fully automatic DB nuking
+                match self.db.stale_guild_delete_limit().await {
+                    Ok(Some(limit)) => match self.db.delete_stale_guilds(guilds, limit).await {
+                        Ok(Some(deleted_stores)) => {
+                            info!("Deleted {} stale stores", deleted_stores.len());
+                            for jinxxy_user_id in deleted_stores {
+                                let result = self.api_cache.unregister_store_in_cache(jinxxy_user_id).await;
+                                if let Err(e) = result {
+                                    warn!("Error unregistering store in cache during stale guild delete: {e:?}");
+                                    return;
+                                }
                             }
                         }
-                    }
-                    Err(e) => error!("Error deleting stale guilds: {e:?}"),
+                        Ok(None) => warn!("Skipped deleting stale guilds as the maximum was exceeded"),
+                        Err(e) => error!("Error deleting stale guilds: {e:?}"),
+                    },
+                    Ok(None) => (), // do nothing
+                    Err(e) => error!("Error reading stale guild delete limit: {e:?}"),
                 }
-                */
             }
             _ => {}
         }
@@ -522,7 +529,7 @@ async fn handle_license_registration(
 ) -> Result<(), JinxError> {
     let start_time = Instant::now();
     let license_key = modal_interaction.data.components.iter().find_map(|component| {
-        if let Component::Label(label) = component
+        if let ModalComponent::Label(label) = component
             && let LabelComponent::InputText(input_text) = &label.component
             && input_text.custom_id == LICENSE_KEY_ID
         {

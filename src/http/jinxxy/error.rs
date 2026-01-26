@@ -1,4 +1,4 @@
-// This file is part of jinx. Copyright © 2025 jinx contributors.
+// This file is part of jinx. Copyright © 2025-2026 jinx contributors.
 // jinx is licensed under the GNU AGPL v3.0 or any later version. See LICENSE file for full text.
 
 use crate::bot::util::{IsDeterministic, SafeDisplay};
@@ -24,8 +24,6 @@ pub enum JinxxyError {
     JsonDeserialize(serde_json::Error),
     /// Some parallel task join failed.
     Join(tokio::task::JoinError),
-    /// Impossible 304 response: we got a 304 without Etag set
-    Impossible304,
     /// We encountered a case where pagination support is required, but unimplemented in Jinx
     UnsupportedPagination(u64),
 }
@@ -42,10 +40,6 @@ impl Display for JinxxyError {
             JinxxyError::HttpRead(e) => write!(f, "HTTP body read failed: {e:?}"),
             JinxxyError::JsonDeserialize(e) => write!(f, "JSON deserialization failed: {e}"),
             JinxxyError::Join(e) => write!(f, "parallel task join failed: {e}"),
-            JinxxyError::Impossible304 => write!(
-                f,
-                "got 304 response from Jinxxy API without having set If-None-Match header"
-            ),
             JinxxyError::UnsupportedPagination(nonce) => write!(
                 f,
                 "Jinxxy API unexpectedly required pagination support! Please report this to the Jinx developer with error code `{nonce}`"
@@ -57,15 +51,41 @@ impl Display for JinxxyError {
 impl<'a> Display for RedactedJinxxyError<'a> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self.0 {
-            JinxxyError::HttpResponse(_) => write!(f, "Jinxxy API error"),
+            JinxxyError::HttpResponse(e) => match &e.body {
+                HttpBody::JsonErrorResponse(response) => {
+                    if e.status_code.is_server_error() {
+                        write!(
+                            f,
+                            "Jinxxy API error:\nHTTP status code: {}\nerror: {}\nmessage: {}\ncode: {}\nrequest id: {}\n**This appears to be due to a Jinxxy API outage. Please report it to the Jinxxy team!**",
+                            e.status_code, response.error, response.message, response.code, response.request_id
+                        )
+                    } else if e.status_code == StatusCode::BAD_REQUEST {
+                        write!(
+                            f,
+                            "Jinxxy API error:\nHTTP status code: {}\nerror: {}\nmessage: {}\ncode: {}\nrequest id: {}\n**This appears to be due to a Jinx bot bug. Please report it to the bot developer!**",
+                            e.status_code, response.error, response.message, response.code, response.request_id
+                        )
+                    } else if e.status_code == StatusCode::UNAUTHORIZED || e.status_code == StatusCode::FORBIDDEN {
+                        write!(
+                            f,
+                            "Jinxxy API error:\nHTTP status code: {}\nerror: {}\nmessage: {}\ncode: {}\nrequest id: {}\n**This appears to be due to a misconfigured API key. Please report it to this server's owner!**",
+                            e.status_code, response.error, response.message, response.code, response.request_id
+                        )
+                    } else {
+                        write!(
+                            f,
+                            "Jinxxy API error:\nHTTP status code: {}\nerror: {}\nmessage: {}\ncode: {}\nrequest id: {}",
+                            e.status_code, response.error, response.message, response.code, response.request_id
+                        )
+                    }
+                }
+                HttpBody::UnknownErrorResponse(_) => write!(f, "Jinxxy API deserialize error: {}", e.status_code),
+                HttpBody::ReadError(_) => write!(f, "Jinxxy API read error: {}", e.status_code),
+            },
             JinxxyError::HttpRequest(_) => write!(f, "HTTP general failure"),
             JinxxyError::HttpRead(_) => write!(f, "HTTP body read failed"),
             JinxxyError::JsonDeserialize(_) => write!(f, "JSON deserialization failed"),
             JinxxyError::Join(e) => write!(f, "parallel task join failed: {e}"),
-            JinxxyError::Impossible304 => write!(
-                f,
-                "got 304 response from Jinxxy API without having set If-None-Match header"
-            ),
             JinxxyError::UnsupportedPagination(nonce) => write!(
                 f,
                 "Jinxxy API unexpectedly required pagination support! Please report this to the Jinx developer with error code `{nonce}`"
@@ -182,7 +202,6 @@ impl IsDeterministic for JinxxyError {
             JinxxyError::HttpRead(_) => false,
             JinxxyError::JsonDeserialize(_) => false, // this is a bit suspect, but could occur if Jinxxy gives an arbitrary status code with an HTML error page, which web APIs are wont to do
             JinxxyError::Join(_) => false,
-            JinxxyError::Impossible304 => true,
             JinxxyError::UnsupportedPagination(_) => true,
         }
     }
@@ -247,8 +266,9 @@ pub struct JinxxyErrorResponse {
     message: JinxxyErrorMessage,
     /// This field appears completely useless for my own use, but might be helpful for the Jinxxy devs if I need to
     /// forward an error report along.
-    #[allow(dead_code)]
     code: String,
+    /// Matches the X-Request-Id header
+    request_id: String,
 }
 
 impl JinxxyErrorResponse {
@@ -300,4 +320,13 @@ impl JinxxyErrorMessage {
 pub struct JinxxyErrorMultiMessagePart {
     message: String,
     code: String,
+}
+
+impl Display for JinxxyErrorMessage {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            JinxxyErrorMessage::SingleMessage(message) => write!(f, "{message}"),
+            JinxxyErrorMessage::MultiMessage(messages) => write!(f, "{messages:?}"), //TODO: display this better
+        }
+    }
 }

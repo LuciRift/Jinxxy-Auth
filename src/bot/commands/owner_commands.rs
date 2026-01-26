@@ -1,16 +1,19 @@
-// This file is part of jinx. Copyright © 2025 jinx contributors.
+// This file is part of jinx. Copyright © 2025-2026 jinx contributors.
 // jinx is licensed under the GNU AGPL v3.0 or any later version. See LICENSE file for full text.
 
 use crate::SHOULD_RESTART;
 use crate::bot::commands::guild_commands;
 use crate::bot::util::{check_owner, error_reply, success_reply};
-use crate::bot::{Context, HOURS_PER_DAY, SECONDS_PER_HOUR, util};
+use crate::bot::{Context, util};
+use crate::constants::{HOURS_PER_DAY, SECONDS_PER_HOUR};
+use crate::db::ActivationCounts;
 use crate::error::JinxError;
 use crate::http::jinxxy;
-use crate::http::jinxxy::{GetProfileImageUrl as _, GetUsername};
+use crate::http::jinxxy::{GetProfileImageUrl as _, GetUsername as _};
 use poise::{CreateReply, serenity_prelude as serenity};
 use serenity::{Colour, CreateEmbed, CreateMessage, GuildId, GuildRef, UserId};
 use std::sync::atomic;
+use tokio::task::JoinSet;
 use tokio::time::{Duration, Instant};
 use tracing::{info, warn};
 
@@ -43,6 +46,7 @@ pub(in crate::bot) async fn owner_stats(
     let api_cache_products = context.data().api_cache.product_count();
     let api_cache_product_versions = context.data().api_cache.product_version_count();
     let api_cache_len = context.data().api_cache.len();
+    let api_cache_registered = context.data().api_cache.registered_stores();
     let log_channel_count = context.data().db.log_channel_count().await?;
     let available_guild_count = context.serenity_context().cache.guild_count(); // available guilds only
     let unavailable_guild_count = context.serenity_context().cache.unavailable_guilds().len(); // unavailable guilds only
@@ -76,7 +80,8 @@ pub(in crate::bot) async fn owner_stats(
         product+version→role links={product_version_role_count}\n\
         API cache total products={api_cache_products}\n\
         API cache total product versions={api_cache_product_versions}\n\
-        API cache guilds={api_cache_len}\n\
+        API cache stores={api_cache_len}\n\
+        API cache registered={api_cache_registered}\n\
         shards={shard_count}{shard_list}\n\
         tokio num_workers={tokio_num_workers}\n\
         tokio num_alive_tasks={tokio_num_alive_tasks}\n\
@@ -383,8 +388,13 @@ pub(in crate::bot) async fn verify_guild(
                         };
                         let administrator = permissions.administrator();
                         let manage_roles = permissions.manage_roles();
-                        let license_activation_count =
-                            context.data().db.guild_license_activation_count(guild_id).await?;
+                        let ActivationCounts {
+                            day_7,
+                            day_30,
+                            day_90,
+                            day_365,
+                            lifetime,
+                        } = context.data().db.guild_license_activation_count(guild_id).await?;
                         let gumroad_failure_count = context
                             .data()
                             .db
@@ -421,7 +431,11 @@ pub(in crate::bot) async fn verify_guild(
                             Test={is_test}\n\
                             Admin={administrator}\n\
                             Manage Roles={manage_roles}\n\
-                            license activations={license_activation_count}\n\
+                            license activations (7d)={day_7}\n\
+                            license activations (30d)={day_30}\n\
+                            license activations (90d)={day_90}\n\
+                            license activations (1yr)={day_365}\n\
+                            license activations (lifetime)={lifetime}\n\
                             failed gumroad licenses={gumroad_failure_count}\n\
                             gumroad nags={gumroad_nag_count}\n\
                             nag role={nag_role}\n\
@@ -472,7 +486,7 @@ pub(in crate::bot) async fn verify_guild(
                         Err(e) => CreateEmbed::default()
                             .title(format!("API Verification Error: {unique_name}"))
                             .color(Colour::RED)
-                            .description(format!("API key invalid: {e}")),
+                            .description(format!("API key invalid:```\n{e}```")),
                     };
                     api_embeds.push(api_embed);
                 }
@@ -514,12 +528,14 @@ pub(in crate::bot) async fn misconfigured_guilds(context: Context<'_>) -> Result
     for guild_id in guilds {
         const OK: char = ' ';
         let api_code = if !context.data().db.has_jinxxy_linked(guild_id).await? {
-            'J'
+            'J' // no jinxxy link exists
+        } else if context.data().db.has_invalid_jinxxy_api_key(guild_id).await? {
+            'I' // link exists, but we've marked an API key as invalid
         } else {
             OK
         };
         let ban_code = if context.data().db.get_guild_ban(guild_id).await? {
-            'B'
+            'B' // guild is banned
         } else {
             OK
         };
@@ -527,9 +543,9 @@ pub(in crate::bot) async fn misconfigured_guilds(context: Context<'_>) -> Result
             && let Ok(permissions) = util::permissions(&context, &bot_member)
         {
             if permissions.administrator() {
-                'A'
+                'A' // bot has Administrator
             } else if !permissions.manage_roles() {
-                'M'
+                'M' // bot lacks Manage Roles
             } else {
                 OK
             }
@@ -951,5 +967,130 @@ pub(in crate::bot) async fn unban_guild(
         }
     }
 
+    Ok(())
+}
+
+/// Delete stale guilds from the DB
+#[poise::command(
+    slash_command,
+    default_member_permissions = "MANAGE_GUILD",
+    check = "check_owner",
+    install_context = "Guild",
+    interaction_context = "Guild"
+)]
+pub(in crate::bot) async fn delete_stale_guilds(
+    context: Context<'_>,
+    #[description = "max allowed stale guilds"] max: u64,
+) -> Result<(), Error> {
+    context.defer_ephemeral().await?;
+    let guilds = context.cache().guilds();
+    let reply = match context.data().db.delete_stale_guilds(&guilds, max).await? {
+        Some(deleted_stores) => {
+            let store_len = deleted_stores.len();
+            for jinxxy_user_id in deleted_stores {
+                context
+                    .data()
+                    .api_cache
+                    .unregister_store_in_cache(jinxxy_user_id)
+                    .await?;
+            }
+            success_reply("Success", format!("Deleted {store_len} stores"))
+        }
+        None => error_reply("Failure", format!("More than max {max} stale guilds detected")),
+    };
+    context.send(reply).await?;
+    Ok(())
+}
+
+/// Backfill missing license activation information
+#[poise::command(
+    slash_command,
+    default_member_permissions = "MANAGE_GUILD",
+    check = "check_owner",
+    install_context = "Guild",
+    interaction_context = "Guild"
+)]
+pub(in crate::bot) async fn backfill_license_activation(context: Context<'_>) -> Result<(), Error> {
+    const PARALLELISM: usize = 4;
+    const PARALLELISM_THRESHOLD: usize = PARALLELISM * 8;
+    context.defer_ephemeral().await?;
+    let db_activations = context.data().db.get_activations_needing_backfill().await?;
+    let parallelism = if db_activations.len() > PARALLELISM_THRESHOLD {
+        PARALLELISM
+    } else {
+        1
+    };
+    let chunk_size = db_activations.len().div_ceil(parallelism);
+    let mut join_set = JoinSet::<Result<(u64, u64), JinxError>>::new();
+    for chunk in db_activations.chunks(chunk_size) {
+        // tragically we must clone here because you can't just split an allocation
+        // the only alternative would be some reference counting solution such as vecshard to drop once all shards are dropped
+        let chunk = chunk.to_vec();
+        let db = context.data().db.clone();
+        join_set.spawn(async move {
+            let mut backfill_count: u64 = 0;
+            let mut skip_count: u64 = 0;
+            for db_activation in chunk {
+                match util::retry_thrice(|| {
+                    jinxxy::get_license_activation(
+                        &db_activation.jinxxy_api_key,
+                        &db_activation.license_id,
+                        &db_activation.license_activation_id,
+                    )
+                })
+                .await
+                {
+                    Ok(Some(api_activation)) => {
+                        let row_updated = db
+                            .backfill_activation(
+                                &db_activation.jinxxy_user_id,
+                                &db_activation.license_id,
+                                db_activation.activator_user_id,
+                                &db_activation.license_activation_id,
+                                &api_activation.created_at,
+                            )
+                            .await?;
+                        if row_updated {
+                            backfill_count += 1;
+                        } else {
+                            skip_count += 1;
+                            warn!("someone beat me to a backfill! weird!");
+                        }
+                    }
+                    Ok(None) => {
+                        skip_count += 1;
+                        warn!(
+                            "DB activation {}:{}:{} did not exist in Jinxxy API",
+                            &db_activation.jinxxy_user_id,
+                            &db_activation.license_id,
+                            &db_activation.license_activation_id
+                        );
+                    }
+                    Err(e) => {
+                        skip_count += 1;
+                        warn!(
+                            "DB activation {}:{}:{} threw Jinxxy error: {:?}",
+                            &db_activation.jinxxy_user_id,
+                            &db_activation.license_id,
+                            &db_activation.license_activation_id,
+                            e
+                        );
+                    }
+                }
+            }
+            Ok((backfill_count, skip_count))
+        });
+    }
+
+    let mut backfill_count: u64 = 0;
+    let mut skip_count: u64 = 0;
+    while let Some(result) = join_set.join_next().await {
+        let (chunk_backfill_count, chunk_skip_count) = result??;
+        backfill_count += chunk_backfill_count;
+        skip_count += chunk_skip_count;
+    }
+
+    let reply = success_reply("Success", format!("Backfilled {backfill_count}, skipped {skip_count}."));
+    context.send(reply).await?;
     Ok(())
 }

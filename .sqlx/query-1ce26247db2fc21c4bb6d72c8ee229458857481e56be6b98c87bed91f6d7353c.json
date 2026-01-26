@@ -1,0 +1,74 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT jinxxy_api_key, jinxxy_user_id, license_id, activator_user_id, license_activation_id FROM license_activation\n               JOIN jinxxy_user_guild USING (jinxxy_user_id)\n               WHERE jinxxy_api_key_valid\n               AND created_at IS NULL",
+  "describe": {
+    "columns": [
+      {
+        "name": "jinxxy_api_key",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "jinxxy_user_guild",
+            "name": "jinxxy_api_key"
+          }
+        }
+      },
+      {
+        "name": "jinxxy_user_id",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "license_activation",
+            "name": "jinxxy_user_id"
+          }
+        }
+      },
+      {
+        "name": "license_id",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "license_activation",
+            "name": "license_id"
+          }
+        }
+      },
+      {
+        "name": "activator_user_id",
+        "ordinal": 3,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "license_activation",
+            "name": "activator_user_id"
+          }
+        }
+      },
+      {
+        "name": "license_activation_id",
+        "ordinal": 4,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "license_activation",
+            "name": "license_activation_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "1ce26247db2fc21c4bb6d72c8ee229458857481e56be6b98c87bed91f6d7353c"
+}

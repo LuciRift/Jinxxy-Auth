@@ -1,4 +1,4 @@
-// This file is part of jinx. Copyright © 2025 jinx contributors.
+// This file is part of jinx. Copyright © 2025-2026 jinx contributors.
 // jinx is licensed under the GNU AGPL v3.0 or any later version. See LICENSE file for full text.
 
 use crate::bot::Bot;
@@ -21,6 +21,11 @@ mod time;
 
 /// constants generated in build.rs
 pub mod constants {
+    pub const SECONDS_PER_MINUTE: u64 = 60;
+    pub const MINUTES_PER_HOUR: u64 = 60;
+    pub const HOURS_PER_DAY: u64 = 24;
+    pub const SECONDS_PER_DAY: u64 = SECONDS_PER_MINUTE * MINUTES_PER_HOUR * HOURS_PER_DAY;
+    pub const SECONDS_PER_HOUR: u64 = SECONDS_PER_MINUTE * MINUTES_PER_HOUR;
     include!(env!("CONSTANTS_PATH"));
 }
 

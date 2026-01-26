@@ -23,7 +23,7 @@ use std::collections::HashSet;
 use std::fmt::{Debug, Display};
 use std::future::Future;
 use std::time::Duration;
-use tracing::{debug, error, warn};
+use tracing::{error, warn};
 
 /// A type with an alternate Display implementation that is safe to display to untrusted users
 pub trait SafeDisplay<'a, T>
@@ -88,7 +88,6 @@ pub async fn trusted_license_to_id(api_key: &str, license: &str) -> Result<Optio
     Ok(license_id)
 }
 
-#[allow(dead_code)]
 pub(super) fn highest_mentionable_role(cache: &impl AsRef<Cache>, guild_id: GuildId) -> Result<Option<RoleId>, Error> {
     let guild = cache
         .as_ref()
@@ -279,11 +278,6 @@ pub fn product_display_name(product_name: &str, product_version_name: Option<&st
             let product_version_len = product_version_name.chars().count();
 
             if product_name_len + product_version_len > MAX_LENGTH {
-                debug!(
-                    "\"{}\" + \"{}\" .chars().count() > 100; truncating…",
-                    product_name, product_version_name
-                );
-
                 // I have to trim either the product name or the product version name or both
                 // It's not trivial to know what will be prettiest, so time for some shitty rules
                 if product_name_len > MAX_LENGTH && product_version_len > MAX_LENGTH {
@@ -326,7 +320,6 @@ pub fn product_display_name(product_name: &str, product_version_name: Option<&st
 /// truncate a string to meet Discord's 100 character autocomplete limit
 pub fn truncate_string_for_discord_autocomplete(string: &str) -> String {
     if string.chars().count() > AUTOCOMPLETE_CHARACTER_LIMIT {
-        debug!("\"{}\".chars().count() > 100; truncating…", string);
         string.chars().take(AUTOCOMPLETE_CHARACTER_LIMIT).collect()
     } else {
         string.to_string()

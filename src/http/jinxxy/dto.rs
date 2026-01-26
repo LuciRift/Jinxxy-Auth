@@ -1,4 +1,4 @@
-// This file is part of jinx. Copyright © 2025 jinx contributors.
+// This file is part of jinx. Copyright © 2025-2026 jinx contributors.
 // jinx is licensed under the GNU AGPL v3.0 or any later version. See LICENSE file for full text.
 
 //! Internal DTOs used only by Jinxxy API response parsing logic
@@ -46,6 +46,13 @@ pub struct License {
     activations: LicenseActivations,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct OrderInfo {
+    id: String,
+    #[allow(dead_code)] // debug printed
+    payment_status: String,
+}
+
 impl From<License> for super::LicenseInfo {
     fn from(license: License) -> Self {
         let product_version_info = license
@@ -64,6 +71,7 @@ impl From<License> for super::LicenseInfo {
             product_id: license.inventory_item.target_id,
             product_name: license.inventory_item.item.name,
             product_version_info,
+            order_id: license.inventory_item.order.map(|order| order.id),
             activations: license.activations.total_count,
         }
     }
@@ -86,6 +94,8 @@ pub struct LicenseInventoryItem {
     target_version_id: Option<String>,
     /// More product metadata
     item: LicenseInventoryItemItem,
+    /// Order metadata
+    order: Option<OrderInfo>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -198,8 +208,10 @@ pub struct PartialProduct {
     pub id: String,
 
     /// Product Name
-    #[allow(dead_code)]
     pub name: String,
+
+    /// All versions of this product
+    pub versions: Vec<ProductVersion>,
 }
 
 /// In addition to all the fields of [`PartialProduct`], this also contains price and version information
@@ -213,9 +225,6 @@ pub struct FullProduct {
     pub name: String,
     /// All versions of this product
     pub versions: Vec<ProductVersion>,
-    /// Etag header value for this `GET /products/<id>` response
-    #[serde(skip)]
-    pub etag: Option<Vec<u8>>,
 }
 
 impl From<FullProduct> for PartialProduct {
@@ -223,6 +232,7 @@ impl From<FullProduct> for PartialProduct {
         Self {
             id: product.id,
             name: product.name,
+            versions: product.versions,
         }
     }
 }
