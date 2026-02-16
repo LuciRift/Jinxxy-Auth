@@ -51,7 +51,7 @@ For example, in the screenshot below Jinx can only manage "test-secret-role" and
 
 ![Role Management UI](docs/images/manage_roles.png)
 
-Next, go to [Jinxxy's API Keys page](https://jinxxy.com/my/dashboard/settings/api-keys) and create a new
+Next, go to [Jinxxy's API Keys page](https://dashboard.jinxxy.com/api-keys) and create a new
 API key with products_read, licenses_read, and licenses_write (see
 [explanation of permissions](docs/permissions-used.md) to learn why we need these). Uncheck the expiration checkbox.
 Make note of the API key when you create it: we'll need it shortly. The form should look like this:
